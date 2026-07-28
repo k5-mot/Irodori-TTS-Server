@@ -41,6 +41,7 @@ dev = [
 
 [project.scripts]
 irodori-openai-tts = "irodori_openai_tts.__main__:main"
+irodori-openai-tts-fetch-voices = "irodori_openai_tts.fetch_voices:main"
 
 [tool.uv]
 conflicts = [

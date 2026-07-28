@@ -142,3 +142,30 @@ def test_write_file_rejects_bad_voice_id_extension_and_empty_data(tmp_path):
         registry.write_file(filename="speaker.txt", data=b"text")
     with pytest.raises(ValueError, match="must not be empty"):
         registry.write_file(filename="speaker.wav", data=b"")
+
+
+def test_seed_bundled_voices_copies_supported_files_without_replacing(tmp_path):
+    target = tmp_path / "voices"
+    bundled = tmp_path / "bundled"
+    bundled.mkdir()
+    target.mkdir()
+    (bundled / "clone_ref1.wav").write_bytes(b"bundled")
+    (bundled / "cached.pt").write_bytes(b"latent")
+    (bundled / "speaker.speaker.safetensors").write_bytes(b"embed")
+    (bundled / "notes.txt").write_bytes(b"text")
+    (target / "clone_ref1.wav").write_bytes(b"existing")
+    registry = make_registry(target, bundled_voices_dir=bundled)
+
+    copied = registry.seed_bundled_voices()
+
+    assert sorted(path.name for path in copied) == ["cached.pt", "speaker.speaker.safetensors"]
+    assert (target / "clone_ref1.wav").read_bytes() == b"existing"
+    assert (target / "cached.pt").read_bytes() == b"latent"
+    assert (target / "speaker.speaker.safetensors").read_bytes() == b"embed"
+    assert not (target / "notes.txt").exists()
+
+
+def test_seed_bundled_voices_ignores_missing_source(tmp_path):
+    registry = make_registry(tmp_path / "voices", bundled_voices_dir=tmp_path / "missing")
+
+    assert registry.seed_bundled_voices() == []

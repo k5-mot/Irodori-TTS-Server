@@ -10,6 +10,8 @@ def restore_app_globals(monkeypatch, tmp_path):
     monkeypatch.setattr(main.settings, "api_key", None)
     monkeypatch.setattr(main.settings, "voices_dir", tmp_path)
     monkeypatch.setattr(main.settings, "voice_aliases_file", None)
+    monkeypatch.setattr(main.settings, "bundled_voices_dir", None)
+    monkeypatch.setattr(main.settings, "voice_samples_repo", None)
     monkeypatch.setattr(main.settings, "default_voice", None)
     monkeypatch.setattr(main.settings, "allow_no_ref_voice", True)
     monkeypatch.setattr(main.settings, "default_chunking_enabled", True)

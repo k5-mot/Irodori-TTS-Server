@@ -4,6 +4,8 @@ services:
       context: .
       args:
         IRODORI_TTS_BACKEND: ${IRODORI_TTS_BACKEND:-cu128}
+        IRODORI_DOWNLOAD_SAMPLE_VOICES: ${IRODORI_DOWNLOAD_SAMPLE_VOICES:-true}
+        IRODORI_VOICE_SAMPLE_REPO: ${IRODORI_VOICE_SAMPLE_REPO:-Aratako/Irodori-TTS-500M-v3}
     image: irodori-openai-tts:local
     command: ["/app/.venv/bin/python", "-m", "irodori_openai_tts"]
     env_file:

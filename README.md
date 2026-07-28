@@ -2,9 +2,9 @@
 
 OpenAI Text-to-Speech API compatible server for [Irodori-TTS](https://github.com/Aratako/Irodori-TTS).
 
-This server targets the [Irodori-TTS 500M v3 base model](https://huggingface.co/Aratako/Irodori-TTS-500M-v3). It supports reference-audio voice cloning, OpenAI-style response formats, and automatic long text chunking.
+This server targets the [Irodori-TTS 500M v3 base model](https://huggingface.co/Aratako/Irodori-TTS-500M-v3). It supports reference-audio voice cloning, OpenAI-style response formats, automatic long text chunking, chunk-level SSE, and binary audio streaming.
 
-Streaming synthesis is not implemented. Requests return one complete audio response.
+Streaming is sentence/chunk based: each text chunk is fully synthesized by Irodori-TTS, then sent immediately while later chunks continue generating. This is not model-internal frame streaming.
 
 ## Features
 
@@ -12,6 +12,8 @@ Streaming synthesis is not implemented. Requests return one complete audio respo
 - Reference voices from files, `voices.json`, or HTTP upload
 - Response formats: `wav`, `mp3`, `flac`, `opus`, `aac`, `pcm`
 - Automatic long text chunking
+- Binary audio streaming with `stream_format: "audio"`
+- Browser Web UI at `/web`
 - Per-request dynamic LoRA adapter loading
 - Optional bearer token auth
 
@@ -74,6 +76,12 @@ Open the health endpoint:
 curl http://localhost:8088/health
 ```
 
+Open the Web UI:
+
+```text
+http://localhost:8088/web
+```
+
 ## Docker
 
 Create `.env` first:
@@ -128,6 +136,12 @@ docker compose -f compose.yaml -f compose.rocm.yaml up
 
 For CPU-only Docker images, set `IRODORI_TTS_BACKEND=cpu` in `.env` before building.
 
+Docker images pre-download Irodori sample reference voices during build by
+default. They are stored in the image at `/opt/irodori/voices` and copied into
+`/app/voices` at startup only when the target file is missing. This keeps the
+samples available even when `./voices` is bind-mounted by Compose, without
+overwriting your local voices.
+
 Reference voices placed in `./voices` are available inside the container. Downloaded Hugging Face files are kept in a Docker volume so they are reused across container recreations.
 
 ## Quick Usage
@@ -137,6 +151,21 @@ Put a reference voice in `voices/`. Files can be added before or after the serve
 ```text
 voices/
   sample.wav
+```
+
+You can fetch the reference voice samples bundled with the Irodori-TTS Hugging
+Face model card:
+
+```bash
+uv run irodori-openai-tts-fetch-voices
+```
+
+By default this downloads `samples/clone_ref*.wav` from
+`Aratako/Irodori-TTS-500M-v3` into `voices/`, making voices such as
+`clone_ref1` and `clone_ref2` available. To fetch every WAV sample instead:
+
+```bash
+uv run irodori-openai-tts-fetch-voices --all-samples
 ```
 
 Then call the speech endpoint:
@@ -213,8 +242,35 @@ Request fields:
 | `voice` | string or object | no | Voice ID, or `{ "id": "voice_id" }`. Uses `IRODORI_DEFAULT_VOICE` if omitted. |
 | `response_format` | string | no | `wav`, `mp3`, `flac`, `opus`, `aac`, or `pcm`. |
 | `speed` | number | no | Speaking speed, from `0.25` to `4.0`. Higher is faster; internally this is converted to an inverse duration scale. |
-| `stream_format` | string | no | Set to `sse` to receive chunk-level Server-Sent Events. |
+| `stream_format` | string | no | Set to `audio`/`binary` for chunked audio bytes, or `sse` for chunk-level Server-Sent Events. |
 | `irodori` | object | no | Irodori-specific inference options. |
+
+When `stream_format: "audio"` or `"binary"` is set, the response is a binary
+`StreamingResponse` with the requested audio media type. The server keeps one
+stream encoder open for the request, so compressed formats are emitted as a
+single continuous stream instead of separate files per chunk.
+
+```bash
+curl -N http://localhost:8088/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "irodori-tts",
+    "input": "最初の文です。次の文です。",
+    "voice": "sample",
+    "response_format": "wav",
+    "stream_format": "audio",
+    "irodori": {
+      "chunking_enabled": true,
+      "chunk_min_chars": 1
+    }
+  }' \
+  --output speech.wav
+```
+
+WAV streams use sentinel size fields because the final length is not known at
+the start of the response. Most browsers and FFmpeg-based tools handle this,
+but Python's stdlib `wave` may report an incorrect duration. Use `pcm` for raw
+low-latency playback, or `mp3`/`opus`/`aac`/`flac` when FFmpeg is installed.
 
 When `stream_format: "sse"` is set, the response is `text/event-stream`.
 The server synthesizes each text chunk sequentially and emits one `audio_chunk`
@@ -254,6 +310,13 @@ data: {"chunks":2}
 
 Each `audio_base64` value contains a complete audio file for that chunk, so
 clients can decode and enqueue chunks while later chunks are still generating.
+
+### Web UI
+
+The server includes a lightweight Web UI at `/web`.
+
+It can generate speech, switch between complete/audio/SSE modes, upload
+reference voices, refresh the voice list, and tune common Irodori options.
 
 Irodori-specific options:
 
@@ -429,6 +492,8 @@ All environment variables use the `IRODORI_` prefix. Request fields override the
 | `IRODORI_MAX_CONCURRENT_SYNTHESIS` | `1` | Maximum simultaneous synthesis jobs. |
 | `IRODORI_SYNTHESIS_WAIT_TIMEOUT` | `300` | Seconds to wait for a synthesis slot. |
 | `IRODORI_VOICES_DIR` | `voices` | Directory scanned for reference voices. |
+| `IRODORI_BUNDLED_VOICES_DIR` | unset locally, `/opt/irodori/voices` in Docker | Optional directory copied into `IRODORI_VOICES_DIR` at startup for missing bundled sample voices. |
+| `IRODORI_VOICE_SAMPLES_REPO` | unset | Optional default Hugging Face repo for `irodori-openai-tts-fetch-voices`; falls back to `IRODORI_HF_CHECKPOINT`. |
 | `IRODORI_DEFAULT_VOICE` | unset | Used when request omits `voice`. |
 | `IRODORI_ALLOW_NO_REF_VOICE` | `true` | Allow `voice: "none"` text-only inference. |
 | `IRODORI_DEFAULT_RESPONSE_FORMAT` | `wav` | Default response format. |
@@ -442,6 +507,13 @@ All environment variables use the `IRODORI_` prefix. Request fields override the
 | `IRODORI_DEFAULT_CHUNKING_ENABLED` | `true` | Enable punctuation-aware chunking by default. |
 | `IRODORI_DEFAULT_CHUNK_MIN_CHARS` | `80` | Minimum non-space characters before a split point is used. |
 | `IRODORI_DEFAULT_FIRST_SENTENCE_CHUNK_MIN_CHARS` | unset | Minimum non-space characters before the first sentence split point is used. Unset keeps normal `chunk_min_chars` behavior. |
+
+Docker build arguments:
+
+| Build arg | Default | Notes |
+| --- | --- | --- |
+| `IRODORI_DOWNLOAD_SAMPLE_VOICES` | `true` | Pre-download sample reference voices into the Docker image. |
+| `IRODORI_VOICE_SAMPLE_REPO` | `Aratako/Irodori-TTS-500M-v3` | Hugging Face repo used for Docker sample voice pre-download. |
 
 ## Development
 

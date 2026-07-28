@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,30 @@ class VoiceRegistry:
         root = self.settings.voices_dir.expanduser()
         root.mkdir(parents=True, exist_ok=True)
         return root
+
+    def seed_bundled_voices(self) -> list[Path]:
+        source_dir = self.settings.bundled_voices_dir
+        if source_dir is None:
+            return []
+
+        source_root = source_dir.expanduser()
+        if not source_root.is_dir():
+            return []
+
+        target_root = self.ensure_dir()
+        if source_root.resolve() == target_root.resolve():
+            return []
+
+        copied = []
+        for source in sorted(source_root.iterdir()):
+            if not source.is_file() or not _is_supported_voice_file(source):
+                continue
+            target = target_root / source.name
+            if target.exists():
+                continue
+            shutil.copyfile(source, target)
+            copied.append(target)
+        return copied
 
     def list(self) -> list[VoiceSpec]:
         voices = self._scan_voice_files()
@@ -238,3 +263,12 @@ class VoiceRegistry:
         if raw.is_absolute():
             return raw
         return self.settings.voices_dir.expanduser() / raw
+
+
+def _is_supported_voice_file(path: Path) -> bool:
+    name_lower = path.name.lower()
+    return (
+        name_lower.endswith(SPEAKER_INVERSION_SUFFIX)
+        or path.suffix.lower() in VOICE_EXTENSIONS
+        or path.suffix.lower() in LATENT_EXTENSIONS
+    )

@@ -39,6 +39,8 @@ class Settings(BaseSettings):
 
     voices_dir: Path = Path("voices")
     voice_aliases_file: Path | None = None
+    bundled_voices_dir: Path | None = None
+    voice_samples_repo: str | None = None
     default_voice: str | None = None
     allow_no_ref_voice: bool = True
 
