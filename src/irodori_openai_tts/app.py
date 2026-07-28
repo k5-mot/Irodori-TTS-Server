@@ -112,6 +112,18 @@ _WEB_UI_HTML = """<!doctype html>
     textarea, input, select { width:100%; border:1px solid var(--line); border-radius:6px; background:var(--field); color:var(--ink); padding:10px 11px; font:inherit; }
     textarea { min-height:230px; resize:vertical; }
     input[type="checkbox"] { width:auto; }
+    .voice-picker { position:relative; }
+    .voice-search { padding-right:34px; }
+    .voice-toggle { position:absolute; right:6px; top:31px; width:28px; min-height:28px; padding:0; border-radius:5px; background:transparent; color:var(--muted); font-size:15px; }
+    .voice-options { position:absolute; z-index:10; top:calc(100% + 6px); left:0; right:0; display:none; max-height:220px; overflow:auto; border:1px solid var(--line); border-radius:6px; background:var(--panel); box-shadow:0 14px 34px rgb(25 32 31 / 14%); padding:6px; }
+    .voice-options.open { display:grid; gap:4px; }
+    .voice-option { display:flex; align-items:center; justify-content:space-between; gap:10px; width:100%; min-height:36px; border:0; border-radius:5px; background:transparent; color:var(--ink); padding:8px 9px; text-align:left; font-weight:650; }
+    .voice-option:hover, .voice-option.active { background:#edf4f1; color:var(--ink); }
+    .voice-option.selected { background:#dff0eb; color:#0d5e4f; }
+    .voice-kind { color:var(--muted); font-size:12px; font-weight:650; }
+    .voice-empty { padding:9px; color:var(--muted); font-size:13px; }
+    .voice-selected { display:flex; align-items:center; justify-content:space-between; gap:10px; min-height:36px; margin-top:8px; border:1px solid var(--line); border-radius:6px; background:#edf4f1; padding:7px 8px 7px 10px; font-size:13px; }
+    .voice-selected button { width:26px; min-height:26px; padding:0; border-radius:5px; background:transparent; color:var(--muted); font-size:16px; }
     .grid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:14px; margin-top:14px; }
     .row { display:flex; align-items:center; gap:10px; }
     .stack { display:grid; gap:14px; }
@@ -140,7 +152,14 @@ _WEB_UI_HTML = """<!doctype html>
       <label for="text">Text</label>
       <textarea id="text">こんにちは。これはIrodori-TTSのWeb UIテストです。</textarea>
       <div class="grid">
-        <div><label for="voice">Voice</label><select id="voice"><option value="none">none</option></select></div>
+        <div class="voice-picker" id="voicePicker">
+          <label for="voiceSearch">Voice</label>
+          <input id="voice" type="hidden" value="none">
+          <input id="voiceSearch" class="voice-search" type="text" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="voiceOptions" placeholder="Search voices...">
+          <button class="voice-toggle" id="voiceToggle" type="button" aria-label="Show voices">v</button>
+          <div class="voice-options" id="voiceOptions" role="listbox"></div>
+          <div class="voice-selected" id="voiceSelected"><span>none</span><button id="clearVoice" type="button" aria-label="Clear voice">x</button></div>
+        </div>
         <div><label for="format">Format</label><select id="format"><option>wav</option><option>mp3</option><option>opus</option><option>flac</option><option>aac</option><option>pcm</option></select></div>
         <div><label for="streamMode">Mode</label><select id="streamMode"><option value="">complete</option><option value="audio">binary stream</option><option value="sse">sse chunks</option></select></div>
       </div>
@@ -177,7 +196,7 @@ _WEB_UI_HTML = """<!doctype html>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
-    const state = { urls: [] };
+    const state = { urls: [], voices: [{ id: "none", no_ref: true }], selectedVoiceId: "none", activeVoiceIndex: 0 };
     function headers(json = true) {
       const out = {};
       if (json) out["Content-Type"] = "application/json";
@@ -188,6 +207,97 @@ _WEB_UI_HTML = """<!doctype html>
     function setStatus(text) { $("status").textContent = text; }
     function setMeter(value) { $("meter").style.width = `${Math.max(0, Math.min(100, value))}%`; }
     function revokeUrls() { state.urls.forEach(URL.revokeObjectURL); state.urls = []; }
+    function normalizeVoices(voices) {
+      const out = [{ id: "none", no_ref: true }];
+      const seen = new Set(["none"]);
+      for (const voice of voices) {
+        const id = String(voice.id || "").trim();
+        if (!id || seen.has(id)) continue;
+        out.push({ id, no_ref: Boolean(voice.no_ref) });
+        seen.add(id);
+      }
+      return out;
+    }
+    function filteredVoices() {
+      const query = $("voiceSearch").value.trim().toLowerCase();
+      if (!query) return state.voices;
+      return state.voices.filter((voice) => voice.id.toLowerCase().includes(query));
+    }
+    function openVoiceMenu() {
+      $("voiceOptions").classList.add("open");
+      $("voiceSearch").setAttribute("aria-expanded", "true");
+      renderVoiceOptions();
+    }
+    function closeVoiceMenu() {
+      $("voiceOptions").classList.remove("open");
+      $("voiceSearch").setAttribute("aria-expanded", "false");
+    }
+    function selectVoice(voiceId) {
+      state.selectedVoiceId = voiceId;
+      $("voice").value = voiceId;
+      $("voiceSearch").value = "";
+      renderSelectedVoice();
+      renderVoiceOptions();
+    }
+    function renderSelectedVoice() {
+      $("voiceSelected").querySelector("span").textContent = state.selectedVoiceId;
+      $("clearVoice").disabled = state.selectedVoiceId === "none";
+    }
+    function renderVoiceOptions() {
+      const options = filteredVoices();
+      const menu = $("voiceOptions");
+      menu.replaceChildren();
+      state.activeVoiceIndex = Math.max(0, Math.min(state.activeVoiceIndex, Math.max(0, options.length - 1)));
+      if (!options.length) {
+        const empty = document.createElement("div");
+        empty.className = "voice-empty";
+        empty.textContent = "No matching voices";
+        menu.append(empty);
+        return;
+      }
+      for (const [index, voice] of options.entries()) {
+        const option = document.createElement("button");
+        option.type = "button";
+        option.className = "voice-option";
+        if (voice.id === state.selectedVoiceId) option.classList.add("selected");
+        if (index === state.activeVoiceIndex) option.classList.add("active");
+        option.setAttribute("role", "option");
+        option.setAttribute("aria-selected", voice.id === state.selectedVoiceId ? "true" : "false");
+
+        const id = document.createElement("span");
+        id.textContent = voice.id;
+        const kind = document.createElement("span");
+        kind.className = "voice-kind";
+        kind.textContent = voice.no_ref ? "text" : "ref";
+        option.append(id, kind);
+
+        option.addEventListener("mousedown", (event) => event.preventDefault());
+        option.addEventListener("click", () => {
+          selectVoice(voice.id);
+          closeVoiceMenu();
+          $("voiceSearch").focus();
+        });
+        menu.append(option);
+      }
+    }
+    function scrollActiveVoiceIntoView() {
+      $("voiceOptions").querySelector(".voice-option.active")?.scrollIntoView({ block: "nearest" });
+    }
+    function renderAvailableVoiceList(voices) {
+      const list = $("voiceList");
+      const rows = voices.length ? voices : [{ id: "none", no_ref: true }];
+      list.replaceChildren();
+      for (const voice of rows) {
+        const row = document.createElement("div");
+        row.className = "voice-item";
+        const id = document.createElement("span");
+        id.textContent = voice.id;
+        const kind = document.createElement("span");
+        kind.textContent = voice.no_ref ? "text" : "ref";
+        row.append(id, kind);
+        list.append(row);
+      }
+    }
     function payload() {
       const irodori = { chunking_enabled: $("chunking").checked, chunk_min_chars: Number($("chunkMin").value || 80), num_steps: Number($("numSteps").value || 40) };
       if ($("firstMin").value) irodori.first_sentence_chunk_min_chars = Number($("firstMin").value);
@@ -207,8 +317,12 @@ _WEB_UI_HTML = """<!doctype html>
       const res = await fetch("/v1/audio/voices", { headers: headers(false) });
       if (!res.ok) throw new Error(await res.text());
       const voices = (await res.json()).data || [];
-      $("voice").innerHTML = `<option value="none">none</option>` + voices.map(v => `<option value="${v.id}">${v.id}</option>`).join("");
-      $("voiceList").innerHTML = voices.map(v => `<div class="voice-item"><span>${v.id}</span><span>${v.no_ref ? "text" : "ref"}</span></div>`).join("") || `<div class="voice-item"><span>none</span><span>text</span></div>`;
+      state.voices = normalizeVoices(voices);
+      if (!state.voices.some((voice) => voice.id === state.selectedVoiceId)) state.selectedVoiceId = "none";
+      $("voice").value = state.selectedVoiceId;
+      renderSelectedVoice();
+      renderVoiceOptions();
+      renderAvailableVoiceList(voices);
     }
     async function generateComplete(body) {
       const res = await fetch("/v1/audio/speech", { method: "POST", headers: headers(), body: JSON.stringify(body) });
@@ -279,6 +393,48 @@ _WEB_UI_HTML = """<!doctype html>
       }
     });
     $("clear").addEventListener("click", () => { $("text").value = ""; $("player").removeAttribute("src"); setStatus(""); setMeter(0); revokeUrls(); });
+    $("voiceSearch").addEventListener("focus", openVoiceMenu);
+    $("voiceSearch").addEventListener("input", () => {
+      state.activeVoiceIndex = 0;
+      openVoiceMenu();
+    });
+    $("voiceSearch").addEventListener("keydown", (event) => {
+      const options = filteredVoices();
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        openVoiceMenu();
+        if (options.length) state.activeVoiceIndex = Math.min(options.length - 1, state.activeVoiceIndex + 1);
+        renderVoiceOptions();
+        scrollActiveVoiceIntoView();
+      } else if (event.key === "ArrowUp") {
+        event.preventDefault();
+        openVoiceMenu();
+        if (options.length) state.activeVoiceIndex = Math.max(0, state.activeVoiceIndex - 1);
+        renderVoiceOptions();
+        scrollActiveVoiceIntoView();
+      } else if (event.key === "Enter") {
+        if (!$("voiceOptions").classList.contains("open") || !options.length) return;
+        event.preventDefault();
+        selectVoice(options[state.activeVoiceIndex].id);
+        closeVoiceMenu();
+      } else if (event.key === "Escape") {
+        closeVoiceMenu();
+      } else if (event.key === "Tab") {
+        closeVoiceMenu();
+      }
+    });
+    $("voiceToggle").addEventListener("click", () => {
+      if ($("voiceOptions").classList.contains("open")) closeVoiceMenu();
+      else openVoiceMenu();
+      $("voiceSearch").focus();
+    });
+    $("clearVoice").addEventListener("click", () => {
+      selectVoice("none");
+      $("voiceSearch").focus();
+    });
+    document.addEventListener("click", (event) => {
+      if (!$("voicePicker").contains(event.target)) closeVoiceMenu();
+    });
     $("refreshVoices").addEventListener("click", () => refreshVoices().catch(err => setStatus(err.message || String(err))));
     $("uploadVoice").addEventListener("click", async () => {
       const file = $("voiceFile").files[0];
@@ -291,6 +447,7 @@ _WEB_UI_HTML = """<!doctype html>
       setStatus("uploaded");
       await refreshVoices();
     });
+    renderSelectedVoice();
     refreshVoices().catch(() => {});
   </script>
 </body>

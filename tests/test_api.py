@@ -300,6 +300,8 @@ def test_web_ui_is_served_without_loading_runtime(monkeypatch):
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
     assert "Irodori-TTS" in response.text
+    assert "Search voices..." in response.text
+    assert 'id="voiceOptions"' in response.text
     assert "/v1/audio/speech" in response.text
     assert manager.thread_ids == []
     assert runtime.texts == []
