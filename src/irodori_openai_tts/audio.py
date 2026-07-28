@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import threading
 from io import BytesIO
 from pathlib import Path
+from queue import Empty, Queue
 from tempfile import TemporaryDirectory
+from typing import Any
 
 import soundfile as sf
 import torch
@@ -67,6 +70,197 @@ def encode_audio(audio: torch.Tensor, sample_rate: int, response_format: str) ->
                 "response_format='wav'/'flac'/'pcm'. "
                 f"Encoder errors: {'; '.join(details)}"
             ) from ffmpeg_exc
+
+
+class StreamingAudioEncoder:
+    def __init__(self, response_format: str, sample_rate: int) -> None:
+        self.fmt = normalize_response_format(response_format, default="mp3")
+        self.sample_rate = int(sample_rate)
+        self._process: subprocess.Popen[bytes] | None = None
+        self._stdout_queue: Queue[bytes] = Queue()
+        self._stderr_queue: Queue[bytes] = Queue()
+        self._stdout_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
+        self._channels: int | None = None
+        self._closed = False
+
+    def write(self, audio: torch.Tensor) -> bytes:
+        if self._closed:
+            raise RuntimeError("Streaming audio encoder is already closed.")
+        wav = _normalize_audio_tensor(audio)
+        if self.fmt == "pcm":
+            return _pcm16_bytes(wav)
+        if self.fmt == "wav":
+            payload = b""
+            if self._channels is None:
+                self._channels = int(wav.shape[0])
+                payload += _streaming_wav_header(
+                    sample_rate=self.sample_rate,
+                    channels=self._channels,
+                )
+            elif self._channels != wav.shape[0]:
+                raise ValueError("Streaming audio chunks must have the same channel count.")
+            return payload + _pcm16_bytes(wav)
+
+        self._ensure_process(channels=wav.shape[0])
+        assert self._process is not None
+        assert self._process.stdin is not None
+        if self._process.poll() is not None:
+            self._raise_process_error()
+        self._process.stdin.write(_float32_interleaved_bytes(wav))
+        self._process.stdin.flush()
+        return self._read_available_output()
+
+    def close(self) -> bytes:
+        if self._closed:
+            return b""
+        self._closed = True
+        if self.fmt in {"pcm", "wav"}:
+            return b""
+        if self._process is None:
+            return b""
+
+        process = self._process
+        if process.stdin is not None:
+            process.stdin.close()
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            process.wait()
+            raise RuntimeError("Timed out while finalizing streaming audio encoder.") from exc
+
+        if self._stdout_thread is not None:
+            self._stdout_thread.join(timeout=1)
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=1)
+        output = self._read_available_output()
+        if process.returncode:
+            self._raise_process_error()
+        return output
+
+    def _ensure_process(self, *, channels: int) -> None:
+        if self._process is not None:
+            if self._channels != channels:
+                raise ValueError("Streaming audio chunks must have the same channel count.")
+            return
+
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise RuntimeError(
+                "ffmpeg executable was not found in PATH; binary streaming for "
+                f"response_format={self.fmt!r} is unavailable. Use response_format='pcm' "
+                "or install ffmpeg."
+            )
+
+        self._channels = int(channels)
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "f32le",
+            "-ar",
+            str(self.sample_rate),
+            "-ac",
+            str(channels),
+            "-i",
+            "pipe:0",
+            "-codec:a",
+            _streaming_ffmpeg_codec(self.fmt),
+            "-f",
+            _ffmpeg_format(self.fmt),
+            "pipe:1",
+        ]
+        self._process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert self._process.stdout is not None
+        assert self._process.stderr is not None
+        self._stdout_thread = _start_pipe_reader(self._process.stdout, self._stdout_queue)
+        self._stderr_thread = _start_pipe_reader(self._process.stderr, self._stderr_queue)
+
+    def _read_available_output(self) -> bytes:
+        chunks = []
+        while True:
+            try:
+                chunks.append(self._stdout_queue.get_nowait())
+            except Empty:
+                break
+        return b"".join(chunks)
+
+    def _raise_process_error(self) -> None:
+        stderr = []
+        while True:
+            try:
+                stderr.append(self._stderr_queue.get_nowait())
+            except Empty:
+                break
+        message = b"".join(stderr).decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg streaming encoder failed: {message or 'unknown error'}")
+
+
+def _start_pipe_reader(pipe: Any, queue: Queue[bytes]) -> threading.Thread:
+    def read_pipe() -> None:
+        try:
+            read = getattr(pipe, "read1", pipe.read)
+            while True:
+                data = read(65536)
+                if not data:
+                    break
+                queue.put(data)
+        finally:
+            pipe.close()
+
+    thread = threading.Thread(target=read_pipe, daemon=True)
+    thread.start()
+    return thread
+
+
+def _normalize_audio_tensor(audio: torch.Tensor) -> torch.Tensor:
+    wav = audio.detach().cpu().float()
+    if wav.ndim == 1:
+        wav = wav.unsqueeze(0)
+    if wav.ndim != 2:
+        raise ValueError(f"Expected audio shape (channels, samples), got {tuple(wav.shape)}")
+    return wav.clamp(-1.0, 1.0).contiguous()
+
+
+def _pcm16_bytes(wav: torch.Tensor) -> bytes:
+    pcm = (wav.transpose(0, 1).numpy() * 32767.0).astype("<i2", copy=False)
+    return pcm.tobytes()
+
+
+def _streaming_wav_header(*, sample_rate: int, channels: int) -> bytes:
+    bits_per_sample = 16
+    block_align = channels * bits_per_sample // 8
+    byte_rate = sample_rate * block_align
+    sentinel_size = 0xFFFFFFFF
+    return b"".join(
+        [
+            b"RIFF",
+            sentinel_size.to_bytes(4, "little"),
+            b"WAVE",
+            b"fmt ",
+            (16).to_bytes(4, "little"),
+            (1).to_bytes(2, "little"),
+            channels.to_bytes(2, "little"),
+            sample_rate.to_bytes(4, "little"),
+            byte_rate.to_bytes(4, "little"),
+            block_align.to_bytes(2, "little"),
+            bits_per_sample.to_bytes(2, "little"),
+            b"data",
+            sentinel_size.to_bytes(4, "little"),
+        ]
+    )
+
+
+def _float32_interleaved_bytes(wav: torch.Tensor) -> bytes:
+    return wav.transpose(0, 1).contiguous().numpy().astype("<f4", copy=False).tobytes()
 
 
 def _soundfile_format(fmt: str) -> tuple[str, str | None]:
@@ -135,6 +329,12 @@ def _ffmpeg_codec(fmt: str) -> str:
     if fmt == "aac":
         return "aac"
     return fmt
+
+
+def _streaming_ffmpeg_codec(fmt: str) -> str:
+    if fmt == "wav":
+        return "pcm_s16le"
+    return _ffmpeg_codec(fmt)
 
 
 def _encode_with_ffmpeg(wav: torch.Tensor, sample_rate: int, fmt: str) -> bytes:

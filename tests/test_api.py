@@ -242,6 +242,69 @@ def test_speech_stream_format_sse_emits_audio_chunk(monkeypatch):
     assert events[1][1] == {"chunks": 1}
 
 
+def test_speech_stream_format_audio_emits_binary_audio_chunks(monkeypatch):
+    runtime = FakeRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "最初です。次です。",
+            "voice": "none",
+            "response_format": "wav",
+            "stream_format": "audio",
+            "irodori": {
+                "chunking_enabled": True,
+                "chunk_min_chars": 1,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("audio/wav")
+    assert response.headers["x-accel-buffering"] == "no"
+    assert response.content.startswith(b"RIFF\xff\xff\xff\xffWAVE")
+    assert response.content.count(b"RIFF") == 1
+    assert runtime.texts == ["最初です。", "次です。"]
+
+
+def test_speech_stream_format_binary_alias(monkeypatch):
+    runtime = FakeRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+
+    response = TestClient(main.app).post(
+        "/v1/audio/speech",
+        json={
+            "model": "irodori-tts",
+            "input": "こんにちは。",
+            "voice": "none",
+            "response_format": "pcm",
+            "stream_format": "binary",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("audio/pcm")
+    assert response.content == b"\x00\x00" * 60
+    assert runtime.texts == ["こんにちは。"]
+
+
+def test_web_ui_is_served_without_loading_runtime(monkeypatch):
+    runtime = FakeRuntime()
+    manager = FakeRuntimeManager(runtime=runtime)
+    monkeypatch.setattr(main, "runtime_manager", manager)
+
+    response = TestClient(main.app).get("/web")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "Irodori-TTS" in response.text
+    assert "/v1/audio/speech" in response.text
+    assert manager.thread_ids == []
+    assert runtime.texts == []
+
+
 def test_speech_rejects_unknown_stream_format_before_loading_runtime(monkeypatch):
     runtime = FakeRuntime()
     manager = FakeRuntimeManager(runtime=runtime)

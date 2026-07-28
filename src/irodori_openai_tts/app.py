@@ -15,12 +15,12 @@ import torch
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from irodori_tts.inference_runtime import SamplingRequest, SamplingResult
 
-from .audio import CONTENT_TYPES, encode_audio, normalize_response_format
+from .audio import CONTENT_TYPES, StreamingAudioEncoder, encode_audio, normalize_response_format
 from .config import get_settings
 from .runtime import RuntimeLoadTimeoutError, RuntimeManager
 from .voices import VoiceRegistry, VoiceSpec
@@ -94,9 +94,219 @@ settings = get_settings()
 runtime_manager = RuntimeManager(settings)
 voice_registry = VoiceRegistry(settings)
 
+_WEB_UI_HTML = """<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Irodori-TTS</title>
+  <style>
+    :root { color-scheme: light; --ink:#19201f; --muted:#66706d; --line:#d8dedb; --paper:#f7f8f5; --panel:#ffffff; --accent:#1d7a68; --accent-2:#b4453f; --field:#fbfcfa; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 15px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: var(--ink); background: var(--paper); }
+    header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 24px; border-bottom:1px solid var(--line); background:#fff; }
+    h1 { margin:0; font-size:20px; font-weight:720; letter-spacing:0; }
+    main { display:grid; grid-template-columns:minmax(0, 1fr) 340px; gap:22px; width:min(1180px, 100%); margin:0 auto; padding:22px; }
+    section, aside { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:18px; }
+    label { display:block; font-size:12px; font-weight:700; color:#3a4441; margin:0 0 7px; }
+    textarea, input, select { width:100%; border:1px solid var(--line); border-radius:6px; background:var(--field); color:var(--ink); padding:10px 11px; font:inherit; }
+    textarea { min-height:230px; resize:vertical; }
+    input[type="checkbox"] { width:auto; }
+    .grid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:14px; margin-top:14px; }
+    .row { display:flex; align-items:center; gap:10px; }
+    .stack { display:grid; gap:14px; }
+    .actions { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:16px; }
+    button { border:0; border-radius:6px; background:var(--accent); color:white; font-weight:750; padding:10px 14px; cursor:pointer; min-height:42px; }
+    button.secondary { background:#2f3b38; }
+    button.warn { background:var(--accent-2); }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    audio { width:100%; margin-top:14px; }
+    .status { min-height:22px; color:var(--muted); font-size:13px; overflow-wrap:anywhere; }
+    .meter { height:8px; border-radius:999px; background:#e7ece9; overflow:hidden; margin-top:10px; }
+    .meter > div { height:100%; width:0%; background:linear-gradient(90deg, var(--accent), #d69d36); transition:width .16s ease; }
+    .voice-list { display:grid; gap:8px; max-height:190px; overflow:auto; border:1px solid var(--line); border-radius:6px; padding:8px; background:var(--field); }
+    .voice-item { display:flex; justify-content:space-between; gap:8px; font-size:13px; border-bottom:1px solid #e7ece9; padding:4px 0; }
+    .voice-item:last-child { border-bottom:0; }
+    @media (max-width: 860px) { main { grid-template-columns:1fr; padding:14px; } header { padding:14px; align-items:flex-start; flex-direction:column; } .grid { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Irodori-TTS</h1>
+    <div class="row"><input id="apiKey" type="password" autocomplete="off" placeholder="Bearer token"><button class="secondary" id="refreshVoices">Voices</button></div>
+  </header>
+  <main>
+    <section>
+      <label for="text">Text</label>
+      <textarea id="text">こんにちは。これはIrodori-TTSのWeb UIテストです。</textarea>
+      <div class="grid">
+        <div><label for="voice">Voice</label><select id="voice"><option value="none">none</option></select></div>
+        <div><label for="format">Format</label><select id="format"><option>wav</option><option>mp3</option><option>opus</option><option>flac</option><option>aac</option><option>pcm</option></select></div>
+        <div><label for="streamMode">Mode</label><select id="streamMode"><option value="">complete</option><option value="audio">binary stream</option><option value="sse">sse chunks</option></select></div>
+      </div>
+      <div class="grid">
+        <div><label for="speed">Speed</label><input id="speed" type="number" min="0.25" max="4" step="0.05" value="1"></div>
+        <div><label for="numSteps">Steps</label><input id="numSteps" type="number" min="1" step="1" value="40"></div>
+        <div><label for="seed">Seed</label><input id="seed" type="number" step="1" placeholder="random"></div>
+      </div>
+      <div class="grid">
+        <div class="row"><input id="chunking" type="checkbox" checked><label for="chunking" style="margin:0">Chunking</label></div>
+        <div><label for="chunkMin">Chunk min chars</label><input id="chunkMin" type="number" min="1" step="1" value="80"></div>
+        <div><label for="firstMin">First min chars</label><input id="firstMin" type="number" min="1" step="1" placeholder="unset"></div>
+      </div>
+      <div class="actions">
+        <button id="generate">Generate</button>
+        <button class="warn" id="clear">Clear</button>
+      </div>
+      <div class="meter"><div id="meter"></div></div>
+      <audio id="player" controls></audio>
+      <div class="status" id="status"></div>
+    </section>
+    <aside class="stack">
+      <div>
+        <label for="voiceFile">Upload Voice</label>
+        <input id="voiceFile" type="file" accept="audio/*,.pt,.pth,.safetensors">
+      </div>
+      <div><label for="voiceId">Voice ID</label><input id="voiceId" placeholder="sample"></div>
+      <button class="secondary" id="uploadVoice">Upload</button>
+      <div>
+        <label>Available Voices</label>
+        <div class="voice-list" id="voiceList"></div>
+      </div>
+    </aside>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const state = { urls: [] };
+    function headers(json = true) {
+      const out = {};
+      if (json) out["Content-Type"] = "application/json";
+      const key = $("apiKey").value.trim();
+      if (key) out.Authorization = key.startsWith("Bearer ") ? key : `Bearer ${key}`;
+      return out;
+    }
+    function setStatus(text) { $("status").textContent = text; }
+    function setMeter(value) { $("meter").style.width = `${Math.max(0, Math.min(100, value))}%`; }
+    function revokeUrls() { state.urls.forEach(URL.revokeObjectURL); state.urls = []; }
+    function payload() {
+      const irodori = { chunking_enabled: $("chunking").checked, chunk_min_chars: Number($("chunkMin").value || 80), num_steps: Number($("numSteps").value || 40) };
+      if ($("firstMin").value) irodori.first_sentence_chunk_min_chars = Number($("firstMin").value);
+      if ($("seed").value) irodori.seed = Number($("seed").value);
+      const body = { model: "irodori-tts", input: $("text").value, voice: $("voice").value || "none", response_format: $("format").value, speed: Number($("speed").value || 1), irodori };
+      if ($("streamMode").value) body.stream_format = $("streamMode").value;
+      return body;
+    }
+    function playBlob(parts, type) {
+      revokeUrls();
+      const url = URL.createObjectURL(new Blob(parts, { type }));
+      state.urls.push(url);
+      $("player").src = url;
+      if (type !== "audio/pcm") $("player").play().catch(() => {});
+    }
+    async function refreshVoices() {
+      const res = await fetch("/v1/audio/voices", { headers: headers(false) });
+      if (!res.ok) throw new Error(await res.text());
+      const voices = (await res.json()).data || [];
+      $("voice").innerHTML = `<option value="none">none</option>` + voices.map(v => `<option value="${v.id}">${v.id}</option>`).join("");
+      $("voiceList").innerHTML = voices.map(v => `<div class="voice-item"><span>${v.id}</span><span>${v.no_ref ? "text" : "ref"}</span></div>`).join("") || `<div class="voice-item"><span>none</span><span>text</span></div>`;
+    }
+    async function generateComplete(body) {
+      const res = await fetch("/v1/audio/speech", { method: "POST", headers: headers(), body: JSON.stringify(body) });
+      if (!res.ok) throw new Error(await res.text());
+      playBlob([await res.blob()], res.headers.get("content-type") || "audio/wav");
+      setMeter(100);
+    }
+    async function generateBinary(body) {
+      const res = await fetch("/v1/audio/speech", { method: "POST", headers: headers(), body: JSON.stringify(body) });
+      if (!res.ok || !res.body) throw new Error(await res.text());
+      const reader = res.body.getReader();
+      const chunks = [];
+      let bytes = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        bytes += value.byteLength;
+        setStatus(`received ${bytes.toLocaleString()} bytes`);
+        setMeter(Math.min(95, Math.max(8, bytes / 3000)));
+      }
+      playBlob(chunks, res.headers.get("content-type") || "audio/wav");
+      setMeter(100);
+    }
+    async function generateSse(body) {
+      const res = await fetch("/v1/audio/speech", { method: "POST", headers: headers(), body: JSON.stringify(body) });
+      if (!res.ok || !res.body) throw new Error(await res.text());
+      const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+      const parts = [];
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += value;
+        const blocks = buffer.split("\\n\\n");
+        buffer = blocks.pop() || "";
+        for (const block of blocks) {
+          const event = block.split("\\n").find(line => line.startsWith("event: "))?.slice(7);
+          const data = block.split("\\n").find(line => line.startsWith("data: "))?.slice(6);
+          if (event === "audio_chunk" && data) {
+            const item = JSON.parse(data);
+            const raw = atob(item.audio_base64);
+            const bytes = new Uint8Array(raw.length);
+            for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+            parts.push(bytes);
+            setStatus(`chunk ${item.index + 1}`);
+            setMeter(Math.min(95, parts.length * 18));
+          } else if (event === "error" && data) {
+            throw new Error(JSON.parse(data).error.message);
+          }
+        }
+      }
+      playBlob(parts, `audio/${body.response_format}`);
+      setMeter(100);
+    }
+    $("generate").addEventListener("click", async () => {
+      $("generate").disabled = true; setMeter(3); setStatus("starting");
+      try {
+        const body = payload();
+        if (body.stream_format === "audio") await generateBinary(body);
+        else if (body.stream_format === "sse") await generateSse(body);
+        else await generateComplete(body);
+        setStatus("done");
+      } catch (err) {
+        setStatus(err.message || String(err)); setMeter(0);
+      } finally {
+        $("generate").disabled = false;
+      }
+    });
+    $("clear").addEventListener("click", () => { $("text").value = ""; $("player").removeAttribute("src"); setStatus(""); setMeter(0); revokeUrls(); });
+    $("refreshVoices").addEventListener("click", () => refreshVoices().catch(err => setStatus(err.message || String(err))));
+    $("uploadVoice").addEventListener("click", async () => {
+      const file = $("voiceFile").files[0];
+      if (!file) return setStatus("select a file");
+      const form = new FormData();
+      form.append("file", file);
+      if ($("voiceId").value.trim()) form.append("voice_id", $("voiceId").value.trim());
+      const res = await fetch("/v1/audio/voices", { method: "POST", headers: headers(false), body: form });
+      if (!res.ok) return setStatus(await res.text());
+      setStatus("uploaded");
+      await refreshVoices();
+    });
+    refreshVoices().catch(() => {});
+  </script>
+</body>
+</html>
+"""
+
 
 def startup() -> None:
     voices_dir = voice_registry.ensure_dir()
+    seeded_voices = voice_registry.seed_bundled_voices()
+    if seeded_voices:
+        logger.info(
+            "seeded bundled voices: count=%d source=%s",
+            len(seeded_voices),
+            settings.bundled_voices_dir,
+        )
     logger.info("voices directory: %s", voices_dir)
     if settings.preload:
         logger.info("preload enabled; loading runtime during startup")
@@ -183,6 +393,9 @@ def health() -> dict[str, Any]:
         },
         "voices": {
             "dir": str(voices_dir),
+            "bundled_dir": None
+            if settings.bundled_voices_dir is None
+            else str(settings.bundled_voices_dir.expanduser()),
             "dir_exists": voices_dir.is_dir(),
             "files": len(voice_registry.list_files()) if voices_dir.is_dir() else 0,
         },
@@ -193,6 +406,12 @@ def health() -> dict[str, Any]:
             "first_sentence_chunk_min_chars": settings.default_first_sentence_chunk_min_chars,
         },
     }
+
+
+@app.get("/web", response_class=HTMLResponse, include_in_schema=False)
+@app.get("/web/", response_class=HTMLResponse, include_in_schema=False)
+def web_ui() -> HTMLResponse:
+    return HTMLResponse(_WEB_UI_HTML)
 
 
 @app.get("/v1/models", dependencies=[Depends(require_auth)])
@@ -307,7 +526,7 @@ def delete_voice(voice_id: str) -> dict[str, Any]:
 @app.post("/v1/audio/speech", dependencies=[Depends(require_auth)])
 async def create_speech(payload: SpeechRequest) -> Response:
     _validate_speech_payload(payload)
-    stream_as_sse = _stream_format_is_sse(payload.stream_format)
+    stream_format = _normalize_stream_format(payload.stream_format)
 
     try:
         response_format = normalize_response_format(
@@ -334,8 +553,15 @@ async def create_speech(payload: SpeechRequest) -> Response:
     except TypeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if stream_as_sse:
+    if stream_format == "sse":
         return _stream_speech_response(
+            sampling_request,
+            chunks,
+            response_format,
+            request_started_at,
+        )
+    if stream_format == "audio":
+        return _stream_speech_audio_response(
             sampling_request,
             chunks,
             response_format,
@@ -386,15 +612,17 @@ async def create_speech(payload: SpeechRequest) -> Response:
     )
 
 
-def _stream_format_is_sse(stream_format: str | None) -> bool:
+def _normalize_stream_format(stream_format: str | None) -> Literal["none", "sse", "audio"]:
     if stream_format is None:
-        return False
+        return "none"
     value = str(stream_format).strip().lower()
     if value == "sse":
-        return True
+        return "sse"
+    if value in {"audio", "binary"}:
+        return "audio"
     raise HTTPException(
         status_code=400,
-        detail="stream_format must be 'sse' when specified.",
+        detail="stream_format must be 'sse', 'audio', or 'binary' when specified.",
     )
 
 
@@ -706,6 +934,80 @@ def _stream_speech_response(
         events(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _stream_speech_audio_response(
+    sampling_request: SamplingRequest,
+    chunks: list[str],
+    response_format: str,
+    request_started_at: float,
+) -> StreamingResponse:
+    async def audio_chunks() -> AsyncIterator[bytes]:
+        completed = 0
+        cancelled = False
+        encoder: StreamingAudioEncoder | None = None
+        try:
+            runtime = await _run_blocking(runtime_manager.get)
+            for index, chunk in enumerate(chunks):
+                logger.info(
+                    "speech binary stream chunk %d/%d started: chars=%d",
+                    index + 1,
+                    len(chunks),
+                    len(chunk),
+                )
+                chunk_request = replace(sampling_request, text=chunk)
+                synthesis_semaphore = await _acquire_synthesis_slot()
+                try:
+                    result = await _run_stream_blocking(
+                        runtime.synthesize,
+                        chunk_request,
+                        log_fn=_log_runtime_message,
+                    )
+                finally:
+                    _release_synthesis_slot(synthesis_semaphore)
+
+                if encoder is None:
+                    encoder = StreamingAudioEncoder(response_format, result.sample_rate)
+                elif encoder.sample_rate != int(result.sample_rate):
+                    raise RuntimeError("Chunk sample rates did not match.")
+
+                payload = await _run_stream_blocking(encoder.write, result.audio)
+                completed += 1
+                logger.info(
+                    "speech binary stream chunk %d/%d completed: audio_seconds=%.2f bytes=%d",
+                    index + 1,
+                    len(chunks),
+                    _audio_duration_seconds(result.audio, result.sample_rate),
+                    len(payload),
+                )
+                if payload:
+                    yield payload
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except Exception:
+            logger.exception("speech binary stream failed")
+            return
+        finally:
+            if encoder is not None:
+                final_payload = await _run_stream_blocking(encoder.close)
+                if final_payload and not cancelled:
+                    yield final_payload
+                logger.info(
+                    "speech binary stream completed: elapsed=%.2fs chunks=%d",
+                    time.perf_counter() - request_started_at,
+                    completed,
+                )
+
+    return StreamingResponse(
+        audio_chunks(),
+        media_type=CONTENT_TYPES[response_format],
+        headers={
+            "Cache-Control": "no-cache",
+            "Content-Disposition": f'attachment; filename="speech.{response_format}"',
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

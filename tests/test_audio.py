@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from irodori_openai_tts import audio as audio_module
-from irodori_openai_tts.audio import encode_audio, normalize_response_format
+from irodori_openai_tts.audio import StreamingAudioEncoder, encode_audio, normalize_response_format
 
 
 def test_normalize_response_format_uses_default_and_lowercases():
@@ -107,6 +107,29 @@ def test_encode_pcm_clamps_and_returns_int16_bytes():
     payload = encode_audio(audio, sample_rate=1000, response_format="pcm")
 
     assert len(payload) == 6
+
+
+def test_streaming_encoder_streams_pcm_bytes():
+    encoder = StreamingAudioEncoder("pcm", sample_rate=1000)
+
+    payload = encoder.write(torch.tensor([[0.0, 1.0], [-1.0, 0.5]]))
+
+    assert payload == b"\x00\x00\x01\x80\xff\x7f\xff?"
+    assert encoder.close() == b""
+
+
+def test_streaming_encoder_streams_wav_header_once():
+    encoder = StreamingAudioEncoder("wav", sample_rate=1000)
+
+    first = encoder.write(torch.zeros(1, 3))
+    second = encoder.write(torch.zeros(1, 2))
+
+    assert first.startswith(b"RIFF\xff\xff\xff\xffWAVE")
+    assert first.count(b"RIFF") == 1
+    assert b"data\xff\xff\xff\xff" in first
+    assert not second.startswith(b"RIFF")
+    assert len(second) == 4
+    assert encoder.close() == b""
 
 
 def test_encode_audio_rejects_invalid_shape():
